@@ -1,6 +1,6 @@
 use async_stream::stream;
-use futures_core::stream::Stream;
-use futures_util::stream::StreamExt;
+pub use futures_core::stream::Stream;
+pub use futures_util::stream::StreamExt;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error};
@@ -31,6 +31,7 @@ enum Response<T> {
     Data(ResponseData<T>),
     Error(GraphQLErrors),
 }
+
 
 impl Client {
     pub fn new(options: ClientOptions) -> Self {
@@ -133,35 +134,43 @@ async fn decode_response<T>(subpath: &str, resp: reqwest::Response) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
 {
-    // Always try to decode the response first. Since even values with non-200
-    // HTTP codes might contain useful error messages
+
     let status = resp.status();
-    match resp.json::<Response<T>>().await {
-        Ok(result) => {
-            // Response was decoded. If it's a GraphQL error, insert the status code
-            match result {
-                Response::Data(data) => Ok(data.data),
-                Response::Error(error) => Err(ResponseError {
-                    status_code: status.as_u16(),
-                    code: error.code,
-                    errors: error.errors,
+    let data = resp.bytes().await.map_err(|e| anyhow::anyhow!("error reading response: {}", e))?;
+    decode_bytes(subpath, status, &data)
+}
+
+fn decode_bytes<T>(subpath: &str, status_code: reqwest::StatusCode, data: &[u8]) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+    {
+        // Try to decode the response first. Since even values with non-200
+        // HTTP codes might contain useful error messages
+        match serde_json::from_slice::<Response<T>>(data) {
+            Ok(response) => {
+                // Response was decoded. If it's a GraphQL error, insert the status code
+                match response {
+                    Response::Data(data) => Ok(data.data),
+                    Response::Error(error) => Err(ResponseError {
+                        status_code: status_code.as_u16(),
+                        code: error.code,
+                        errors: error.errors,
+                    }.into()),
                 }
-                .into()),
-            }
-        }
+            },
         Err(error) => {
-            if !status.is_success() {
+            if !status_code.is_success() {
                 error!(
                     "request to {} failed with status: {}",
                     subpath,
-                    status.as_u16()
+                    status_code.as_u16()
                 );
-                return Err(Error::InvalidHTTPStatusCodeError(status.as_u16()));
+                return Err(Error::InvalidHTTPStatusCodeError(status_code.as_u16()));
             }
-            Err(anyhow::anyhow!("failed to parse response: {}", error).into())
+            Err(error.into())
         }
     }
-}
+    }
 
 async fn streaming_request<T, U>(
     client: &Client,
@@ -178,10 +187,12 @@ where
         .join(subpath)
         .map_err(|e| anyhow::anyhow!("failed to parse url subpath: {}", e))?;
 
+    let data = serde_json::to_string(&input)?;
+
     let req = client
         .client
         .get(url)
-        .query(&[("wg_variables", input)])
+        .query(&[("wg_variables", data)])
         .header("Accept", "application/json")
         .header("Content-Type", "application/json");
 
@@ -198,7 +209,8 @@ where
         .await
         .map_err(|e| anyhow::anyhow!("failed to send request: {}", e))?;
 
-    if !resp.status().is_success() {
+    let status = resp.status();
+    if !status.is_success() {
         error!(
             "subscription/live query failed with status: {}",
             resp.status().as_u16()
@@ -208,11 +220,10 @@ where
 
     let mut resp_stream = resp.bytes_stream();
 
+    let subpath = String::from(subpath);
     let stream = stream!(while let Some(item) = resp_stream.next().await {
-        let item = item.map_err(|e| anyhow::anyhow!("failed to read response: {}", e))?;
-        let item = serde_json::from_slice::<U>(&item)
-            .map_err(|e| anyhow::anyhow!("failed to parse response: {}", e))?;
-        yield Ok(item);
+        let data = item.map_err(|e| anyhow::anyhow!("failed to read response: {}", e))?;
+        yield decode_bytes(&subpath, status, &data)
     });
 
     Ok(stream)

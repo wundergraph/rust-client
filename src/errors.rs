@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    #[error("error serializing data: {0}")]
+    #[error("error serializing or deserializing data: {0}")]
     SerializationError(#[from] serde_json::Error),
     #[error("invalid HTTP response status code {0}")]
     InvalidHTTPStatusCodeError(u16),
