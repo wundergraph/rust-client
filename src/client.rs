@@ -13,11 +13,13 @@ use crate::{
 #[derive(Default, Clone)]
 pub struct ClientOptions {
     pub url: Option<Url>,
+    pub application_hash: Option<String>,
 }
 
 pub struct Client {
     client: reqwest::Client,
     url: Url,
+    application_hash: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -32,15 +34,16 @@ enum Response<T> {
     Error(GraphQLErrors),
 }
 
-
 impl Client {
     pub fn new(options: ClientOptions) -> Self {
         let base = options
             .url
             .unwrap_or_else(|| Url::parse("http://localhost:9991/").unwrap());
+        let application_hash = options.application_hash.unwrap_or_default();
         Self {
             client: reqwest::Client::new(),
             url: base.join("/operations/").unwrap(),
+            application_hash,
         }
     }
 
@@ -62,6 +65,7 @@ impl Client {
             .client
             .get(url)
             .query(&[("wg_variables", data)])
+            .query(&[("wg_app_hash", &self.application_hash)])
             .header("Accept", "application/json")
             .header("Content-Type", "application/json");
 
@@ -90,6 +94,7 @@ impl Client {
         let req = self
             .client
             .post(url)
+            .query(&[("wg_app_hash", &self.application_hash)])
             .json(&input)
             .header("Accept", "application/json");
 
@@ -113,7 +118,7 @@ impl Client {
         I: Serialize,
         R: for<'de> Deserialize<'de>,
     {
-        streaming_request(self, subpath.as_ref(), input, false).await
+        streaming_request(self, subpath.as_ref(), &self.application_hash, input, false).await
     }
 
     pub async fn live_query<P, I, R>(
@@ -126,7 +131,7 @@ impl Client {
         I: Serialize,
         R: for<'de> Deserialize<'de>,
     {
-        streaming_request(self, subpath.as_ref(), input, true).await
+        streaming_request(self, subpath.as_ref(), &self.application_hash, input, true).await
     }
 }
 
@@ -134,30 +139,33 @@ async fn decode_response<T>(subpath: &str, resp: reqwest::Response) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
 {
-
     let status = resp.status();
-    let data = resp.bytes().await.map_err(|e| anyhow::anyhow!("error reading response: {}", e))?;
+    let data = resp
+        .bytes()
+        .await
+        .map_err(|e| anyhow::anyhow!("error reading response: {}", e))?;
     decode_bytes(subpath, status, &data)
 }
 
 fn decode_bytes<T>(subpath: &str, status_code: reqwest::StatusCode, data: &[u8]) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
-    {
-        // Try to decode the response first. Since even values with non-200
-        // HTTP codes might contain useful error messages
-        match serde_json::from_slice::<Response<T>>(data) {
-            Ok(response) => {
-                // Response was decoded. If it's a GraphQL error, insert the status code
-                match response {
-                    Response::Data(data) => Ok(data.data),
-                    Response::Error(error) => Err(ResponseError {
-                        status_code: status_code.as_u16(),
-                        code: error.code,
-                        errors: error.errors,
-                    }.into()),
+{
+    // Try to decode the response first. Since even values with non-200
+    // HTTP codes might contain useful error messages
+    match serde_json::from_slice::<Response<T>>(data) {
+        Ok(response) => {
+            // Response was decoded. If it's a GraphQL error, insert the status code
+            match response {
+                Response::Data(data) => Ok(data.data),
+                Response::Error(error) => Err(ResponseError {
+                    status_code: status_code.as_u16(),
+                    code: error.code,
+                    errors: error.errors,
                 }
-            },
+                .into()),
+            }
+        }
         Err(error) => {
             if !status_code.is_success() {
                 error!(
@@ -170,11 +178,12 @@ where
             Err(error.into())
         }
     }
-    }
+}
 
 async fn streaming_request<T, U>(
     client: &Client,
     subpath: &str,
+    application_hash: &str,
     input: T,
     live: bool,
 ) -> Result<impl Stream<Item = Result<U>>>
@@ -193,6 +202,7 @@ where
         .client
         .get(url)
         .query(&[("wg_variables", data)])
+        .query(&[("wg_app_hash", application_hash)])
         .header("Accept", "application/json")
         .header("Content-Type", "application/json");
 
@@ -222,6 +232,7 @@ where
 
     let subpath = String::from(subpath);
     let stream = stream!(while let Some(item) = resp_stream.next().await {
+        // TODO: Handle chunking
         let data = item.map_err(|e| anyhow::anyhow!("failed to read response: {}", e))?;
         yield decode_bytes(&subpath, status, &data)
     });
