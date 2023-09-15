@@ -1,3 +1,4 @@
+// Based on Kirill Valiavin's initial client implementation
 use async_stream::stream;
 pub use futures_core::stream::Stream;
 pub use futures_util::stream::StreamExt;
